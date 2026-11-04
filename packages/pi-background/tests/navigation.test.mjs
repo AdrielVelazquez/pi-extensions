@@ -3,7 +3,7 @@ import { readFileSync } from "node:fs";
 import { setTimeout as delay } from "node:timers/promises";
 import { test } from "node:test";
 import { createJiti } from "jiti";
-import { visibleWidth } from "@earendil-works/pi-tui";
+import { Editor, TuiMainScreen, visibleWidth } from "@earendil-works/pi-tui";
 
 const { default: background } = await createJiti(import.meta.url).import("../extensions/background.ts");
 const down = "\x1b[B";
@@ -33,14 +33,12 @@ async function setup(t, settings = {}) {
 		getText: () => editorText,
 		setText: (text) => { editorText = text; },
 		handleInput: (data) => { editorText += data; },
+		onCtrlD() {},
 		render: () => [], invalidate() {},
 	};
-	const tui = {
-		focusedComponent: editor,
-		terminal: { rows: 24 },
-		setFocus(component) { this.focusedComponent = component; },
-		requestRender() {},
-	};
+	const tui = new TuiMainScreen({ rows: 24, columns: 100, write() {}, hideCursor() {}, showCursor() {} });
+	tui.requestRender = () => {};
+	tui.setFocus(editor);
 	const ctx = {
 		mode: "tui", hasUI: true, cwd: process.cwd(),
 		sessionManager: { getBranch: () => [] },
@@ -193,4 +191,34 @@ test("hidden widgets do not capture arrow keys", async (t) => {
 	const h = await setup(t, { background: { jobs: "off" } });
 	await h.start();
 	assert.equal(await h.key(down), false);
+});
+
+test("completion beneath a real overlay restores the prompt when the overlay closes", async (t) => {
+	const h = await setup(t);
+	await h.start("sleep 0.2");
+	await h.key(down);
+	const overlay = { render: () => ["overlay"], invalidate() {}, handleInput() {} };
+	const handle = h.tui.showOverlay(overlay);
+	await waitFor(() => h.completions.length > 0);
+	h.render();
+	assert.equal(h.tui.getFocusedComponent(), overlay);
+	handle.hide();
+	h.render();
+	assert.equal(h.tui.getFocusedComponent(), h.editor);
+	await h.key("x");
+	assert.equal(h.editor.getText(), "x");
+});
+
+test("native editable dialogs do not activate jobs, including an empty modal", async (t) => {
+	const h = await setup(t);
+	await h.start();
+	const modal = new Editor(h.tui, { borderColor: (text) => text, selectList: {} });
+	modal.setText("modal draft");
+	h.tui.setFocus(modal);
+	assert.equal(await h.key(down), false);
+	assert.equal(h.tui.getFocusedComponent(), modal);
+	assert.equal(modal.getText(), "modal draft");
+	modal.setText("");
+	assert.equal(await h.key(right), false);
+	assert.equal(h.tui.getFocusedComponent(), modal);
 });

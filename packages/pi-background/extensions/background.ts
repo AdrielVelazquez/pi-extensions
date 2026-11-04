@@ -210,19 +210,22 @@ export default function (pi: ExtensionAPI) {
 	const jobsWidget = (tui: TUI, theme: any, ctx: ExtensionContext) => {
 		let selected: string | undefined;
 		let editor: Component | undefined;
-		// Like other empty-editor widgets, check the focused component structurally across module boundaries.
-		const focused = () => (tui as unknown as { focusedComponent?: Component & { getText?(): string; setText?(text: string): void } }).focusedComponent;
+		// Main editors have Pi's app-exit hook; a raw Editor in a modal does not.
+		const focused = () => (tui as unknown as { focusedComponent?: Component & { getText?(): string; setText?(text: string): void; onCtrlD?: unknown } }).focusedComponent;
 		releaseJobs = () => {
 			selected = undefined;
-			if (editor && focused() === widget) tui.setFocus(editor);
-			editor = undefined;
+			if (editor && focused() === widget) {
+				tui.setFocus(editor);
+				editor = undefined;
+			} else if (!sessionActive) editor = undefined;
 			redrawJobs();
 		};
 		activateJobs = () => {
 			const current = focused();
 			const live = running();
-			if (jobsLine() === "off" || viewing || live.length === 0 || ctx.ui.getEditorText() !== ""
-				|| typeof current?.getText !== "function" || typeof current.setText !== "function") return false;
+			if (jobsLine() === "off" || viewing || live.length === 0 || ctx.ui.getEditorText() !== "" || tui.hasOverlay()
+				|| typeof current?.getText !== "function" || typeof current.setText !== "function"
+				|| typeof current.onCtrlD !== "function" || current.getText() !== "") return false;
 			editor = current;
 			selected = live[0].id;
 			tui.setFocus(widget);
@@ -253,6 +256,8 @@ export default function (pi: ExtensionAPI) {
 				redrawJobs();
 			},
 			render(width: number) {
+				// An overlay can restore focus here after completion already cleared the selection.
+				if (!selected && editor && focused() === widget) releaseJobs();
 				if (jobsLine() === "off") return [];
 				const live = running().filter((job) => job !== viewing);
 				const silentFor = (job: Job) => Date.now() - (job.lastOutput ?? job.started);
