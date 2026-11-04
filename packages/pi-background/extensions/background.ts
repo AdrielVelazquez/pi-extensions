@@ -2,7 +2,7 @@ import { createWriteStream, mkdirSync, readFileSync } from "node:fs";
 import { homedir, tmpdir } from "node:os";
 import { join } from "node:path";
 import { type BashOperations, createBashToolDefinition, createLocalBashOperations, type ExtensionAPI, type ExtensionContext } from "@earendil-works/pi-coding-agent";
-import { Key, matchesKey, stripTerminalSequences, truncateToWidth, visibleWidth, wrapTextWithAnsi } from "@earendil-works/pi-tui";
+import { type Component, type TUI, isKeyRelease, Key, matchesKey, stripTerminalSequences, truncateToWidth, visibleWidth, wrapTextWithAnsi } from "@earendil-works/pi-tui";
 import { Type } from "typebox";
 import { shortCommand } from "./command.ts";
 
@@ -188,6 +188,9 @@ export default function (pi: ExtensionAPI) {
 	// The widget is set once per session and redrawn in place: setting it again would move it below the widgets other
 	// extensions added since, while running jobs belong at the top, next to what Pi is doing now
 	let redrawJobs = () => {};
+	let activateJobs = () => false;
+	let releaseJobs = () => {};
+	let sessionActive = false;
 	let ticker: NodeJS.Timeout | undefined;
 	const showJobs = () => {
 		// A running job's elapsed time and latest output change every second
@@ -195,6 +198,7 @@ export default function (pi: ExtensionAPI) {
 		else {
 			clearInterval(ticker);
 			ticker = undefined;
+			releaseJobs();
 		}
 		redrawJobs();
 	};
@@ -203,31 +207,83 @@ export default function (pi: ExtensionAPI) {
 	const hinted = new Map<string, () => void>();
 	(globalThis as any)[Symbol.for("pi-background.movable")] = hinted;
 	let stopCtrlB = () => {};
-	const jobsWidget = (theme: any) => ({
-		invalidate() {},
-		render(width: number) {
-			if (jobsLine() === "off") return [];
-			const live = running().filter((job) => job !== viewing);
-			const silentFor = (job: Job) => Date.now() - (job.lastOutput ?? job.started);
-			let lines: string[];
-			if (live.length <= MAX_SHOWN_JOBS) {
-				lines = live.map((job) => {
-					const silent = silentFor(job);
-					const detail = silent >= SILENT_AFTER_MS ? ` · no output for ${duration(silent)}` : jobsLine() === "full" && job.lastLine ? ` · ${job.lastLine}` : "";
-					const text = theme.fg("accent", "⏵ ") + theme.fg("toolTitle", `${job.id} ${shownCommand(job.command)}`) + theme.fg("dim", ` · ${elapsed(job)}${detail}`);
-					return truncateToWidth(text, width);
-				});
-			} else {
-				// Past a few jobs, a line each crowds the input, so they share one with just the count, and a warning when
-				// some have gone quiet, since they may be stuck; /bg has the rest
-				const silent = live.filter((job) => silentFor(job) >= SILENT_AFTER_MS).length;
-				const warning = silent ? theme.fg("warning", ` · ${silent} silent for ${SILENT_AFTER_MS / 60_000}m+`) : "";
-				lines = [truncateToWidth(theme.fg("accent", "⏵ ") + theme.fg("toolTitle", `${live.length} jobs`) + warning, width)];
-			}
-			if (hinted.size > 0 && !(globalThis as any)[Symbol.for("pi-polish.showsMoveHint")]) lines.push(theme.fg("dim", "  ctrl+b to run in background"));
-			return lines;
-		},
-	});
+	const jobsWidget = (tui: TUI, theme: any, ctx: ExtensionContext) => {
+		let selected: string | undefined;
+		let editor: Component | undefined;
+		// Like other empty-editor widgets, check the focused component structurally across module boundaries.
+		const focused = () => (tui as unknown as { focusedComponent?: Component & { getText?(): string; setText?(text: string): void } }).focusedComponent;
+		releaseJobs = () => {
+			selected = undefined;
+			if (editor && focused() === widget) tui.setFocus(editor);
+			editor = undefined;
+			redrawJobs();
+		};
+		activateJobs = () => {
+			const current = focused();
+			const live = running();
+			if (jobsLine() === "off" || viewing || live.length === 0 || ctx.ui.getEditorText() !== ""
+				|| typeof current?.getText !== "function" || typeof current.setText !== "function") return false;
+			editor = current;
+			selected = live[0].id;
+			tui.setFocus(widget);
+			redrawJobs();
+			return true;
+		};
+		const widget: Component = {
+			invalidate() {},
+			handleInput(data: string) {
+				if (isKeyRelease(data)) return;
+				const live = running();
+				const index = Math.max(0, live.findIndex((job) => job.id === selected));
+				if (live.length > 0 && (matchesKey(data, Key.down) || data === "j")) {
+					selected = live[Math.min(live.length - 1, index + 1)].id;
+				} else if (live.length > 0 && index > 0 && (matchesKey(data, Key.up) || data === "k")) {
+					selected = live[index - 1].id;
+				} else if (live.length > 0 && matchesKey(data, Key.enter)) {
+					const id = live[index].id;
+					releaseJobs();
+					void showJob(id, ctx).catch((error) => {
+						if (sessionActive) ctx.ui.notify(String(error), "error");
+					});
+				} else {
+					const previous = editor;
+					releaseJobs();
+					if (!matchesKey(data, Key.escape) && !matchesKey(data, Key.up) && data !== "k") previous?.handleInput?.(data);
+				}
+				redrawJobs();
+			},
+			render(width: number) {
+				if (jobsLine() === "off") return [];
+				const live = running().filter((job) => job !== viewing);
+				const silentFor = (job: Job) => Date.now() - (job.lastOutput ?? job.started);
+				if (selected && live.length === 0) releaseJobs();
+				if (selected && !live.some((job) => job.id === selected)) selected = live[0]?.id;
+				const index = live.findIndex((job) => job.id === selected);
+				const height = Math.max(1, Math.floor(tui.terminal.rows / 2) - 2);
+				const start = Math.max(0, index - height + 1);
+				let lines: string[];
+				if (selected || live.length <= MAX_SHOWN_JOBS) {
+					lines = (selected ? live.slice(start, start + height) : live).map((job) => {
+						const silent = silentFor(job);
+						const detail = silent >= SILENT_AFTER_MS ? ` · no output for ${duration(silent)}` : jobsLine() === "full" && job.lastLine ? ` · ${job.lastLine}` : "";
+						const text = theme.fg("accent", job.id === selected ? "› " : "⏵ ") + theme.fg("toolTitle", `${job.id} ${shownCommand(job.command)}`) + theme.fg("dim", ` · ${elapsed(job)}${detail}`);
+						return truncateToWidth(text, width);
+					});
+				} else {
+					// Past a few jobs, a line each crowds the input, so they share one with just the count, and a warning when
+					// some have gone quiet, since they may be stuck; /bg has the rest
+					const silent = live.filter((job) => silentFor(job) >= SILENT_AFTER_MS).length;
+					const warning = silent ? theme.fg("warning", ` · ${silent} silent for ${SILENT_AFTER_MS / 60_000}m+`) : "";
+					lines = [truncateToWidth(theme.fg("accent", "⏵ ") + theme.fg("toolTitle", `${live.length} jobs`) + warning, width)];
+				}
+				if (selected) lines.push(truncateToWidth(theme.fg("dim", `  ${index + 1}/${live.length} · ↑↓ move · enter output · esc close`), width));
+				else if (live.length > 0) lines.push(truncateToWidth(theme.fg("dim", "  ↓ / → jobs · /bg"), width));
+				if (hinted.size > 0 && !(globalThis as any)[Symbol.for("pi-polish.showsMoveHint")]) lines.push(truncateToWidth(theme.fg("dim", "  ctrl+b to run in background"), width));
+				return lines;
+			},
+		};
+		return widget;
+	};
 
 	const find = (id: string): Job => {
 		const job = jobs.get(id);
@@ -574,17 +630,22 @@ export default function (pi: ExtensionAPI) {
 
 	// After /reload or a resume, carry on after the ids already in the conversation so "bg3" keeps meaning one job
 	pi.on("session_start", async (_event, ctx) => {
+		sessionActive = true;
 		if (ctx.mode === "tui") {
 			ctx.ui.setWidget("background-jobs", (tui, theme) => {
 				redrawJobs = () => tui.requestRender();
-				return jobsWidget(theme);
+				return jobsWidget(tui, theme, ctx);
 			});
 			// ctrl+b moves running bash commands to the background; otherwise it stays the editor's cursor-left
 			stopCtrlB();
 			stopCtrlB = ctx.ui.onTerminalInput((data) => {
-				if (hinted.size === 0 || !matchesKey(data, Key.ctrl("b"))) return undefined;
-				for (const move of [...hinted.values()]) move();
-				return { consume: true };
+				if (isKeyRelease(data)) return undefined;
+				if (hinted.size > 0 && matchesKey(data, Key.ctrl("b"))) {
+					for (const move of [...hinted.values()]) move();
+					return { consume: true };
+				}
+				if ((matchesKey(data, Key.down) || matchesKey(data, Key.right)) && activateJobs()) return { consume: true };
+				return undefined;
 			});
 		}
 		for (const entry of ctx.sessionManager.getBranch()) {
@@ -595,6 +656,12 @@ export default function (pi: ExtensionAPI) {
 	});
 
 	pi.on("session_shutdown", async () => {
+		sessionActive = false;
+		stopCtrlB();
+		releaseJobs();
+		activateJobs = () => false;
+		releaseJobs = () => {};
+		redrawJobs = () => {};
 		clearInterval(ticker);
 		for (const timer of holds.values()) clearTimeout(timer);
 		holds.clear();
